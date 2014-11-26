@@ -15,8 +15,9 @@
 import logging
 
 from cinderclient import exceptions as cinder_exception
-from cinderclient import service_catalog
 from cinderclient.v2 import client as cinderclient
+from keystoneclient import exceptions as ks_exceptions
+from keystoneclient import session
 from oslo.config import cfg
 
 from glance_store.common import utils
@@ -40,64 +41,16 @@ _CINDER_OPTS = [
     cfg.StrOpt('os_region_name',
                default=None,
                help='Region name of this node'),
-    cfg.StrOpt('cinder_ca_certificates_file',
-               default=None,
-               help='Location of ca certicates file to use for cinder client '
-                    'requests.'),
     cfg.IntOpt('cinder_http_retries',
                default=3,
                help='Number of cinderclient retries on failed http calls'),
-    cfg.BoolOpt('cinder_api_insecure',
-                default=False,
-                help='Allow to perform insecure SSL requests to cinder'),
 ]
 
 
-def get_cinderclient(conf, context):
-    if conf.glance_store.cinder_endpoint_template:
-        url = conf.glance_store.cinder_endpoint_template % context.to_dict()
-    else:
-        info = conf.glance_store.cinder_catalog_info
-        service_type, service_name, endpoint_type = info.split(':')
-
-        # extract the region if set in configuration
-        if conf.glance_store.os_region_name:
-            attr = 'region'
-            filter_value = conf.glance_store.os_region_name
-        else:
-            attr = None
-            filter_value = None
-
-        # FIXME: the cinderclient ServiceCatalog object is mis-named.
-        #        It actually contains the entire access blob.
-        # Only needed parts of the service catalog are passed in, see
-        # nova/context.py.
-        compat_catalog = {
-            'access': {'serviceCatalog': context.service_catalog or []}}
-        sc = service_catalog.ServiceCatalog(compat_catalog)
-
-        url = sc.url_for(attr=attr,
-                         filter_value=filter_value,
-                         service_type=service_type,
-                         service_name=service_name,
-                         endpoint_type=endpoint_type)
-
-    LOG.debug(_('Cinderclient connection created using URL: %s') % url)
-
-    glance_store = conf.glance_store
-    c = cinderclient.Client(context.user,
-                            context.auth_token,
-                            project_id=context.tenant,
-                            auth_url=url,
-                            insecure=glance_store.cinder_api_insecure,
-                            retries=glance_store.cinder_http_retries,
-                            cacert=glance_store.cinder_ca_certificates_file)
-
-    # noauth extracts user_id:project_id from auth_token
-    c.client.auth_token = context.auth_token or '%s:%s' % (context.user,
-                                                           context.tenant)
-    c.client.management_url = url
-    return c
+_CINDER_OPTS.extend([session.Session.get_conf_options(deprecated_opts={
+    'cafile': [cfg.DeprecatedOpt('cinder_ca_certificates_file')],
+    'insecure': [cfg.DeprecatedOpt('cinder_api_insecure')]
+})])
 
 
 class StoreLocation(glance_store.location.StoreLocation):
@@ -133,6 +86,14 @@ class Store(glance_store.driver.Store):
     OPTIONS = _CINDER_OPTS
     EXAMPLE_URL = "cinder://<VOLUME_ID>"
 
+    def __init__(self, conf):
+        super(Store, self).__init__(conf)
+        self.session = session.Session.load_from_conf_options(conf,
+                                                              'glance_store')
+
+        info = conf.glance_store.cinder_catalog_info.split(':')
+        self.service_type, self.service_name, self.endpoint_type = info
+
     def get_schemes(self):
         return ('cinder',)
 
@@ -148,10 +109,19 @@ class Store(glance_store.driver.Store):
             reason = _("Cinder storage requires a context.")
             raise exceptions.BadStoreConfiguration(store_name="cinder",
                                                    reason=reason)
-        if context.service_catalog is None:
-            reason = _("Cinder storage requires a service catalog.")
-            raise exceptions.BadStoreConfiguration(store_name="cinder",
-                                                   reason=reason)
+
+    def _get_cinderclient(self, context):
+        endpoint_override = self.conf.glance_store.cinder_endpoint_template
+        if endpoint_override:
+            endpoint_override = endpoint_override % context.to_dict()
+
+        auth_plugin = context.get_auth_plugin()
+
+        return cinderclient.Client(
+            session=self.session,
+            auth=auth_plugin,
+            region_name=self.conf.glance_store.os_region_name,
+            retries=self.conf.glance_store.cinder_http_retries)
 
     def get_size(self, location, context=None):
         """
@@ -168,8 +138,7 @@ class Store(glance_store.driver.Store):
 
         try:
             self._check_context(context)
-            volume = get_cinderclient(self.conf,
-                                      context).volumes.get(loc.volume_id)
+            volume = self._get_cinderclient(context).volumes.get(loc.volume_id)
             # GB unit convert to byte
             return volume.size * (1024 ** 3)
         except cinder_exception.NotFound as e:
@@ -177,6 +146,10 @@ class Store(glance_store.driver.Store):
                        "volume can not be found: %s") % self.volume_id
             LOG.error(reason)
             raise exceptions.NotFound(reason)
+        except ks_exceptions.EndpointNotFound:
+            reason = _("Cinder endpoint could not be determined")
+            raise exceptions.BadStoreConfiguration(store_name="cinder",
+                                                   reason=reason)
         except Exception as e:
             LOG.exception(_("Failed to get image size due to "
                             "internal error: %s") % e)
