@@ -23,10 +23,10 @@ import mock
 import tempfile
 import uuid
 
-import httpretty
 from oslo.config import cfg
 from oslo.utils import units
 from oslotest import moxstubout
+import requests_mock
 import six
 import StringIO
 import swiftclient
@@ -1047,8 +1047,8 @@ class TestMultiTenantStoreContext(base.StoreBaseTest):
         }]
         self.addCleanup(self.conf.reset)
 
-    @httpretty.activate
-    def test_download_context(self):
+    @requests_mock.mock()
+    def test_download_context(self, m):
         """Verify context (ie token) is passed to swift on download."""
         self.config(swift_store_multi_tenant=True)
         store = Store(self.conf)
@@ -1058,15 +1058,13 @@ class TestMultiTenantStoreContext(base.StoreBaseTest):
         ctx = context.RequestContext(
             service_catalog=self.service_catalog, user='tenant:user1',
             tenant='tenant', auth_token='0123')
-        httpretty.register_uri(httpretty.GET,
-                               "http://127.0.0.1:0/glance_123/123",
-                               status=200)
-        store.get(loc, context=ctx)
-        self.assertEqual(
-            '0123', httpretty.last_request().headers['X-Auth-Token'])
 
-    @httpretty.activate
-    def test_upload_context(self):
+        m.get("http://127.0.0.1:0/glance_123/123")
+        store.get(loc, context=ctx)
+        self.assertEqual('0123', m.last_request.headers['X-Auth-Token'])
+
+    @requests_mock.mock()
+    def test_upload_context(self, m):
         """Verify context (ie token) is passed to swift on upload."""
         def put_callback(request, uri, headers):
             self.assertEqual('Some data', request.body)
@@ -1077,12 +1075,12 @@ class TestMultiTenantStoreContext(base.StoreBaseTest):
             self.assertEqual('0123', request.headers['X-Auth-Token'])
             return (200, headers, "")
 
-        httpretty.register_uri(httpretty.HEAD,
-                               "http://127.0.0.1:0/glance_123",
-                               head_callback)
-        httpretty.register_uri(httpretty.PUT,
-                               "http://127.0.0.1:0/glance_123/123",
-                               put_callback)
+        head_req = m.head("http://127.0.0.1:0/glance_123",
+                          text='Some data',
+                          request_headers={'X-Auth-Token': '0123'},
+                          status_code=201)
+        put_req = m.put("http://127.0.0.1:0/glance_123/123",
+                        request_headers={'X-Auth-Token': '0123'})
 
         self.config(swift_store_multi_tenant=True)
         store = Store(self.conf)
@@ -1093,8 +1091,9 @@ class TestMultiTenantStoreContext(base.StoreBaseTest):
             tenant='tenant', auth_token='0123')
         store.add('123', pseudo_file, pseudo_file.len,
                   context=ctx)
-        self.assertEqual(
-            '0123', httpretty.last_request().headers['X-Auth-Token'])
+
+        self.assertTrue(head_req.called)
+        self.assertTrue(put_req.called)
 
 
 class FakeGetEndpoint(object):
